@@ -1,0 +1,72 @@
+# ============================================
+# LeiaPix AI - .gitignore
+# ============================================
+
+# --------------- Node.js / 前端 ---------------
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# --------------- Python / 后端 ---------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+*.egg
+
+# --------------- AI 模型权重文件 ---------------
+*.pth
+*.onnx
+*.pt
+*.bin
+*.safetensors
+*.h5
+*.pb
+ai-models/depth/depth_anything_v2/weights/
+ai-models/depth/midas/weights/
+ai-models/depth/leres/weights/
+ai-models/enhance/real_esrgan/weights/
+ai-models/segmentation/sam/weights/
+
+# --------------- 环境配置 ---------------
+.env
+.env.local
+.env.*.local
+deploy/docker/.env
+
+# --------------- IDE / 编辑器 ---------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --------------- 操作系统 ---------------
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --------------- 日志与临时文件 ---------------
+*.log
+logs/
+tmp/
+temp/
+
+# --------------- 测试与覆盖率 ---------------
+coverage/
+htmlcov/
+.coverage
+.coverage.*
+.pytest_cache/
+
+# --------------- Docker ---------------
+docker-compose.override.yml
+
+# --------------- 其他 ---------------
+*.bak
+*.tmp
