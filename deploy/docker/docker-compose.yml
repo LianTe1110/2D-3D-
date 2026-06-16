@@ -1,0 +1,290 @@
+# ============================================
+# LeiaPix AI - Docker Compose (完整生产环境)
+# ============================================
+# 用法:
+#   docker compose up -d                          启动所有服务
+#   docker compose up -d postgres redis minio     仅启动中间件
+#   docker compose up -d worker-depth             仅启动深度估计 Worker
+#   docker compose down                           停止并移除容器
+#   docker compose down -v                        停止并清除数据卷
+#
+# 构建镜像:
+#   docker compose build backend
+#   docker compose build worker-depth
+#   docker compose build worker-enhance
+#   docker compose build worker-export
+# ============================================
+
+services:
+  # ==========================================
+  # 中间件集群
+  # ==========================================
+
+  # --------------- PostgreSQL 16 ---------------
+  postgres:
+    image: postgres:16
+    container_name: leiapix-postgres
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-leiapix}
+      POSTGRES_USER: ${POSTGRES_USER:-leiapix}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-leiapix}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-leiapix} -d ${POSTGRES_DB:-leiapix}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --------------- Redis 7 Alpine ---------------
+  redis:
+    image: redis:7-alpine
+    container_name: leiapix-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --------------- MinIO 对象存储 ---------------
+  minio:
+    image: minio/minio
+    container_name: leiapix-minio
+    restart: unless-stopped
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-leiapix}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-leiapix123}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --------------- MinIO 初始化 ---------------
+  minio-init:
+    image: minio/mc
+    container_name: leiapix-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-leiapix}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-leiapix123}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set leiapix http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing leiapix/leiapix-storage &&
+      echo -n '.keep' | mc pipe leiapix/leiapix-storage/images/original/.keep &&
+      echo -n '.keep' | mc pipe leiapix/leiapix-storage/images/thumbnail/.keep &&
+      echo -n '.keep' | mc pipe leiapix/leiapix-storage/images/enhanced/.keep &&
+      echo -n '.keep' | mc pipe leiapix/leiapix-storage/depth_maps/.keep &&
+      echo -n '.keep' | mc pipe leiapix/leiapix-storage/scenes/.keep &&
+      echo -n '.keep' | mc pipe leiapix/leiapix-storage/textures/.keep &&
+      echo -n '.keep' | mc pipe leiapix/leiapix-storage/exports/.keep &&
+      mc anonymous set download leiapix/leiapix-storage/images/thumbnail &&
+      echo '=== MinIO initialized: bucket leiapix-storage with subdirectories ==='
+      "
+
+  # --------------- MongoDB 7 ---------------
+  mongodb:
+    image: mongo:7
+    container_name: leiapix-mongodb
+    restart: unless-stopped
+    ports:
+      - "${MONGO_PORT:-27017}:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-leiapix}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-leiapix123}
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================
+  # 应用服务
+  # ==========================================
+
+  # --------------- FastAPI 后端 API ---------------
+  backend:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.backend
+    container_name: leiapix-backend
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://leiapix:leiapix@postgres:5432/leiapix
+      DATABASE_URL_SYNC: postgresql://leiapix:leiapix@postgres:5432/leiapix
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-leiapix}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-leiapix123}
+      MONGO_URI: mongodb://leiapix:leiapix123@mongodb:27017
+      GPU_ENABLED: "false"
+      MODEL_PATH: /app/ai-models
+      JWT_SECRET: ${JWT_SECRET:-dev-secret}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
+    volumes:
+      - model_weights:/app/ai-models
+
+  # ==========================================
+  # Celery Worker 集群 (独立镜像, 依赖隔离)
+  # ==========================================
+
+  # --------------- Worker: 深度估计 (GPU) ---------------
+  # 镜像: pytorch/pytorch:2.4.0-cuda12.4 + Depth Anything V2
+  # 并发: 2 (24G VRAM) / 1 (12G VRAM)
+  # 队列: gpu_depth
+  worker-depth:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.worker-depth
+    container_name: leiapix-worker-depth
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://leiapix:leiapix@postgres:5432/leiapix
+      DATABASE_URL_SYNC: postgresql://leiapix:leiapix@postgres:5432/leiapix
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-leiapix}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-leiapix123}
+      GPU_ENABLED: "true"
+      MODEL_PATH: /app/ai-models
+      # GPU 显存保护: 最大可用显存 (MB), 超过则拒绝新任务
+      GPU_MAX_MEMORY_MB: ${GPU_DEPTH_MAX_MEMORY_MB:-8192}
+    volumes:
+      - model_weights:/app/ai-models
+    # GPU 设备挂载 (需要 nvidia-docker2)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # --------------- Worker: 图像增强 (GPU) ---------------
+  # 镜像: pytorch/pytorch:2.4.0-cuda12.1 + Real-ESRGAN
+  # 并发: 1 (超分辨率显存占用极大)
+  # 队列: gpu_enhance
+  worker-enhance:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.worker-enhance
+    container_name: leiapix-worker-enhance
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://leiapix:leiapix@postgres:5432/leiapix
+      DATABASE_URL_SYNC: postgresql://leiapix:leiapix@postgres:5432/leiapix
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-leiapix}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-leiapix123}
+      GPU_ENABLED: "true"
+      MODEL_PATH: /app/ai-models
+      # GPU 显存保护: Real-ESRGAN x4plus 需要更大显存
+      GPU_MAX_MEMORY_MB: ${GPU_ENHANCE_MAX_MEMORY_MB:-10240}
+    volumes:
+      - model_weights:/app/ai-models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # --------------- Worker: 视频导出 (CPU) ---------------
+  # 镜像: python:3.13 + Playwright + ffmpeg
+  # 并发: 4 (CPU 密集, 无 GPU)
+  # 队列: export
+  worker-export:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.worker-export
+    container_name: leiapix-worker-export
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://leiapix:leiapix@postgres:5432/leiapix
+      DATABASE_URL_SYNC: postgresql://leiapix:leiapix@postgres:5432/leiapix
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-leiapix}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-leiapix123}
+      GPU_ENABLED: "false"
+      MODEL_PATH: /app/ai-models
+      # 前端页面 URL (Playwright 需要访问)
+      FRONTEND_URL: ${FRONTEND_URL:-http://host.docker.internal:5173}
+    volumes:
+      - model_weights:/app/ai-models
+
+# --------------- 数据卷 ---------------
+volumes:
+  pgdata:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+  mongo_data:
+    driver: local
+  model_weights:
+    driver: local

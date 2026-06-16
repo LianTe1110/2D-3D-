@@ -1,0 +1,50 @@
+# ============================================
+# LeiaPix AI - Celery Worker: 视频导出 (export 队列)
+# ============================================
+# 独立依赖: Playwright (headless Chromium) + ffmpeg
+# 并发上限: 4 (CPU 密集, 无 GPU)
+# 构建: docker build -f deploy/docker/Dockerfile.worker-export -t leiapix-worker-export .
+# ============================================
+
+FROM python:3.13-slim AS export-base
+
+# 系统依赖: ffmpeg + Playwright 浏览器依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libpq-dev curl ffmpeg \
+    libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+    libcups2 libdrm2 libxkbcommon0 libxcomposite1 \
+    libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 \
+    libcairo2 libasound2 libxshmfence1 && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ---- 安装后端核心依赖 ----
+COPY backend/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# ---- 安装导出专用依赖 ----
+RUN pip install --no-cache-dir \
+    playwright>=1.43.0 \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 安装 Playwright Chromium
+RUN playwright install chromium
+
+# 复制后端代码
+COPY backend/ /app/
+
+# 复制 AI 模型代码 (导出任务不需要, 但保持代码结构一致)
+COPY ai-models/ /app/ai-models/
+
+# CPU 导出 Worker 启动命令
+# --concurrency=4: CPU 密集, 4 并发
+# -Q export: 仅消费 export 队列
+# --max-tasks-per-child=20: 每 20 个任务重启进程
+CMD ["celery", "-A", "app.core.celery_app:celery_app", "worker", \
+     "--loglevel=info", \
+     "--concurrency=4", \
+     "-Q", "export", \
+     "--max-tasks-per-child=20", \
+     "--without-heartbeat", \
+     "-n", "worker-export@%h"]

@@ -1,0 +1,29 @@
+# ============================================
+# LeiaPix AI - 后端 API 服务基础镜像
+# ============================================
+# 构建: docker build -f deploy/docker/Dockerfile.backend -t leiapix-backend .
+# 运行: docker run -p 8000:8000 leiapix-backend
+# ============================================
+
+FROM python:3.13-slim AS base
+
+# 系统依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libpq-dev curl && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 安装 Python 依赖
+COPY backend/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 复制后端代码
+COPY backend/ /app/
+
+# 复制 AI 模型代码 (仅框架, 权重在运行时挂载)
+COPY ai-models/ /app/ai-models/
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
