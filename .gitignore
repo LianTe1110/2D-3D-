@@ -70,3 +70,4 @@ docker-compose.override.yml
 # --------------- 其他 ---------------
 *.bak
 *.tmp
+._cache_*
