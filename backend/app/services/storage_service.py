@@ -139,6 +139,49 @@ def get_enhanced_url(storage_key: str) -> str:
     return f"/api/v1/files/{storage_key}"
 
 
+def upload_mpi_layer(
+    user_id: str,
+    image_id: str,
+    layer_index: int,
+    layer_image: Image.Image,
+) -> str:
+    """上传 MPI 层纹理 PNG 到 MinIO
+
+    Args:
+        user_id: 用户 ID
+        image_id: 图片 ID
+        layer_index: 层索引
+        layer_image: RGBA 层纹理 PIL Image
+
+    Returns:
+        MinIO 存储键
+    """
+    settings = get_settings()
+    client = get_minio_client()
+
+    storage_key = f"mpi_layers/{user_id}/{image_id}/layer_{layer_index}.png"
+    buffer = io.BytesIO()
+    layer_image.save(buffer, format="PNG")
+    buffer.seek(0)
+    data_length = buffer.getbuffer().nbytes
+
+    client.put_object(
+        bucket_name=settings.MINIO_BUCKET,
+        object_name=storage_key,
+        data=buffer,
+        length=data_length,
+        content_type="image/png",
+    )
+
+    logger.info(f"MPI layer uploaded: {storage_key} ({data_length} bytes)")
+    return storage_key
+
+
+def get_mpi_layer_url(storage_key: str) -> str:
+    """获取 MPI 层纹理的访问 URL"""
+    return f"/api/v1/files/{storage_key}"
+
+
 # ============ 导出文件 (MP4/GIF/PNG) ============
 
 def upload_export_file(

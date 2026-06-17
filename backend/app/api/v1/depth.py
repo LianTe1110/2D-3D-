@@ -8,13 +8,17 @@ POST /api/v1/depth/estimate
 
 GET /api/v1/depth/task/{task_id}
 - 从 Redis 查询任务进度
+
+POST /api/v1/depth/estimate-mpi
+- 同步: 上传 → 深度+分割+分层 → 返回 MPI 数据 (个人使用简化版)
 """
 
 import logging
+import os
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -178,3 +182,123 @@ async def get_task_status(task_id: str):
 
     await engine.dispose()
     return result
+
+
+@router.post("/depth/estimate-mpi", summary="同步 MPI 场景生成 (个人使用)")
+async def estimate_depth_mpi(file: UploadFile = File(...)):
+    """同步: 上传图片 → 深度+分割+分层 → 返回 MPI 数据
+
+    个人使用简化版: 不走 Celery 队列, 直接同步处理返回。
+    """
+    import sys
+    import time
+    import numpy as np
+    from pathlib import Path
+    from PIL import Image
+    from fastapi.responses import FileResponse
+
+    # ai-models 目录加入 Python 路径
+    ai_models_path = str(Path(__file__).resolve().parents[3] / "ai-models")
+    if ai_models_path not in sys.path:
+        sys.path.insert(0, ai_models_path)
+
+    start_time = time.time()
+
+    try:
+        # 1. 读取上传图片
+        image = Image.open(file.file)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
+        # 2. 加载深度引擎
+        from model_manager import ModelManager
+        manager = ModelManager()
+        depth_engine = manager.get_engine("depth_anything_v2")
+        depth_time_start = time.time()
+
+        # 3. 带置信度的深度估计
+        depth_result = depth_engine.predict_with_confidence(image)
+        depth_time = time.time() - depth_time_start
+
+        # 4. 尝试 SAM2 分割
+        seg_time = 0
+        seg_result = {"seg_mask": None, "num_layers": 3}
+        try:
+            available = [m["name"] for m in manager.list_available()]
+            if "sam2" in available:
+                seg_time_start = time.time()
+                sam_engine = manager.get_engine("sam2")
+                seg_result = sam_engine.predict(image)
+                seg_time = time.time() - seg_time_start
+        except Exception:
+            pass
+
+        # 5. 融合 + 分解
+        layer_time_start = time.time()
+        fused = depth_engine.fuse_with_segmentation(depth_result, seg_result)
+        n_layers = min(seg_result.get("num_layers", 3), 5)
+        scene_layers = depth_engine.decompose_scene(fused, image, n_layers=n_layers)
+
+        # 6. 可选 Inpainting
+        try:
+            from inpaint.lama.engine import LaMaInpaintEngine
+            inpaint_engine = LaMaInpaintEngine(None)  # OpenCV fallback
+            for i, layer_data in enumerate(scene_layers):
+                if layer_data["occlusion_mask"].sum() > 1000:
+                    layer_data["texture"] = inpaint_engine.inpaint_layer(
+                        layer_texture=layer_data["texture"],
+                        occlusion_mask=layer_data["occlusion_mask"],
+                        original_image=image,
+                    )
+        except Exception:
+            pass
+
+        # 7. 保存层纹理到本地磁盘
+        mpi_dir = Path("data/mpi")
+        mpi_dir.mkdir(parents=True, exist_ok=True)
+
+        layer_urls = []
+        for i, layer_data in enumerate(scene_layers):
+            layer_path = mpi_dir / f"layer_{i}.png"
+            layer_data["texture"].save(str(layer_path))
+            layer_urls.append({
+                "id": f"layer_{i}",
+                "textureUrl": f"/api/v1/depth/mpi-file/layer_{i}.png",
+                "zIndex": layer_data["z_position"],
+                "motionScale": layer_data["motion_scale"],
+                "parallaxDirection": "both",
+                "blendMode": "premultiplied",
+            })
+
+        layer_time = time.time() - layer_time_start
+        elapsed = time.time() - start_time
+
+        return {
+            "mpi_layers": layer_urls,
+            "metadata": {
+                "width": image.width,
+                "height": image.height,
+                "layerCount": len(scene_layers),
+                "modelUsed": "depth_anything_v2",
+                "processingTimeMs": round(elapsed * 1000, 1),
+                "depthTimeMs": round(depth_time * 1000, 1),
+                "segTimeMs": round(seg_time * 1000, 1),
+                "layerTimeMs": round(layer_time * 1000, 1),
+            },
+        }
+
+    except Exception as e:
+        logger.error(f"MPI estimation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/depth/mpi-file/{filename}", summary="MPI 层纹理文件服务")
+async def serve_mpi_file(filename: str):
+    """提供 MPI 层纹理文件 (个人使用, 直接从磁盘读取)"""
+    from fastapi.responses import FileResponse
+    from pathlib import Path
+
+    file_path = Path("data/mpi") / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(str(file_path), media_type="image/png")

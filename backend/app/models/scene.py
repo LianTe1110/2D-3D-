@@ -1,9 +1,9 @@
-"""LeiaPix AI - 场景表模型"""
+"""LeiaPix AI - 场景表模型 (含 MPI 扩展)"""
 
 import uuid
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, Index, String
+from sqlalchemy import ForeignKey, Index, String, Integer, Float
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -32,6 +32,14 @@ class Scene(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(
         String(20), default="processing"
     )  # processing / ready / failed
+
+    # Phase 2: MPI 扩展
+    layer_count: Mapped[int | None] = mapped_column(Integer, default=3)
+    layers: Mapped[dict | None] = mapped_column(JSONB, default=None)  # MPILayer 列表
+    models_used: Mapped[dict | None] = mapped_column(JSONB, default=None)  # {"depth": "dav2", "seg": "sam2"}
+    processing_time_ms: Mapped[float | None] = mapped_column(Float, default=None)
+    camera_config: Mapped[dict | None] = mapped_column(JSONB, default=None)
+    metadata: Mapped[dict | None] = mapped_column(JSONB, default=None)
 
     __table_args__ = (
         Index("ix_scenes_user_id", "user_id"),

@@ -23,6 +23,18 @@ export interface DepthResult {
   depth_url: string
   model_used: string
   processing_time_ms: number
+  mpi_layers?: MPILayer[]
+  /** Normal estimation result (Phase 2: Stable Normal) */
+  normal_map_url?: string
+  normal_method?: string        // "stable_normal" | "sobel_depth" | "none"
+}
+
+export interface NormalResult {
+  image_id: string
+  normal_map_url: string
+  normal_method: string         // "stable_normal" | "sobel_depth" | "none"
+  confidence: number            // 0-1
+  processing_time_ms: number
 }
 
 // ============ Upload ============
@@ -223,6 +235,10 @@ export interface RenderResponse {
     far_plane: number
     camera_distance: number
     mesh_subdivision: number
+    layer_count?: number
+    layer_scales?: number[]
+    edge_freeze_strength?: number
+    camera_parallax?: boolean
   }
   animation_params: {
     type: string
@@ -230,5 +246,38 @@ export interface RenderResponse {
     speed: number
     duration: number
     direction: string
+  }
+}
+
+// ============ MPI (Multi-Plane Image) Types ============
+
+export interface MPILayer {
+  id: string                    // 层唯一标识
+  textureUrl: string            // RGBA 纹理 URL (MinIO/S3)
+  depthMapUrl?: string          // 该层深度图 URL (可选)
+  normalUrl?: string            // 该层法线图 URL (可选, Phase 2)
+  zIndex: number                // Z 轴位置 (从远到近递增)
+  motionScale: number           // 视差运动倍率
+  parallaxDirection: 'horizontal' | 'vertical' | 'both'
+  blendMode: 'normal' | 'additive' | 'premultiplied'
+  // Level 3: 逐物体
+  objectId?: number | null      // 物体 ID (null=BG)
+  label?: string                // 物体标签 (如 "人物", "汽车")
+}
+
+export interface MPIScene {
+  layers: MPILayer[]
+  cameraConfig: {
+    fov: number
+    nearPlane: number
+    farPlane: number
+    baseDistance: number
+  }
+  metadata: {
+    width: number
+    height: number
+    layerCount: number
+    modelUsed: string
+    processingTimeMs: number
   }
 }

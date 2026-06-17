@@ -11,6 +11,8 @@ import logging
 import sys
 from pathlib import Path
 
+import numpy as np
+
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.celery_app import celery_app
@@ -28,8 +30,8 @@ if AI_MODELS_PATH not in sys.path:
     bind=True,
     name="app.tasks.depth_task.estimate_depth",
     max_retries=3,
-    time_limit=60,
-    soft_time_limit=55,
+    time_limit=300,       # 5 分钟: 完整流水线 (Depth+SAM2+Inpaint+Upload)
+    soft_time_limit=280,
 )
 def estimate_depth(
     self,
@@ -115,6 +117,99 @@ def estimate_depth(
 
             logger.info(f"Depth map uploaded: {depth_storage_key}")
 
+            # ========== 5.5 MPI Layer Generation (Phase 2) ==========
+            await redis_client.set_task_progress(
+                task_id=task_id, status="processing", progress=85,
+                task_type="depth", user_id=user_id,
+            )
+
+            # 生成 MPI 分层 + 可选 SAM2 分割 + 可选 Inpainting
+            layer_urls = None
+            try:
+                from app.services.storage_service import upload_mpi_layer, get_mpi_layer_url
+
+                # Step 1: 带置信度的深度估计
+                depth_result = engine.predict_with_confidence(image)
+
+                # Step 2: 尝试 SAM2 分割 + Stable Normal 法线估计 (可选, 并行)
+                seg_result = {"seg_mask": None, "num_layers": 3}
+                normal_result = {"normal": None, "method": "none", "confidence": None}
+                try:
+                    from model_manager import ModelManager as MM
+                    mm = MM()
+                    available = [m["name"] for m in mm.list_available()]
+
+                    if "sam2" in available:
+                        try:
+                            sam_engine = mm.get_engine("sam2")
+                            seg_result = sam_engine.predict(image)
+                            logger.info(f"SAM2 segmentation: {seg_result.get('num_layers', 0)} layers detected")
+                        except Exception as sam_err:
+                            logger.debug(f"SAM2 skipped (model not available): {sam_err}")
+
+                    if "stable_normal" in available:
+                        try:
+                            normal_engine = mm.get_engine("stable_normal")
+                            normal_result = normal_engine.predict_normal(image, depth_result["depth"])
+                            logger.info(f"Normal estimation: method={normal_result.get('method', 'none')}")
+                        except Exception as normal_err:
+                            logger.debug(f"StableNormal skipped (model not available): {normal_err}")
+                except Exception as model_err:
+                    logger.debug(f"Multi-model setup skipped: {model_err}")
+
+                # Step 3: 四路融合 (Depth + Seg + Normal + Confidence)
+                if normal_result["normal"] is not None:
+                    fused = engine.fuse_multi_modal(depth_result, seg_result, normal_result)
+                else:
+                    fused = engine.fuse_with_segmentation(depth_result, seg_result)
+
+                # Step 4: 场景分解 (逐物体 → 识别到的都动起来)
+                if seg_result.get("seg_mask") is not None:
+                    scene_layers = engine.decompose_per_object(fused, image, seg_result)
+                    logger.info(f"Per-object decomposition: {len(scene_layers)} layers (1 BG + {len(scene_layers)-1} objects)")
+                else:
+                    n_layers = min(seg_result.get("num_layers", 3), 5)
+                    scene_layers = engine.decompose_scene(fused, image, n_layers=n_layers)
+                    logger.info(f"Scene decomposed: {len(scene_layers)} layers")
+
+                # Step 5: 可选 Inpainting
+                try:
+                    from inpaint.lama.engine import LaMaInpaintEngine
+                    inpaint_engine = LaMaInpaintEngine("weights/lama_large")
+                    for i, layer_data in enumerate(scene_layers):
+                        if layer_data["occlusion_mask"].sum() > 1000:
+                            layer_data["texture"] = inpaint_engine.inpaint_layer(
+                                layer_texture=layer_data["texture"],
+                                occlusion_mask=layer_data["occlusion_mask"],
+                                original_image=image,
+                            )
+                            logger.info(f"Layer {i} inpainting completed")
+                except Exception as inpaint_err:
+                    logger.debug(f"Inpainting skipped (model not available): {inpaint_err}")
+
+                # Step 6: 上传每层纹理到 MinIO
+                layer_urls = []
+                for i, layer_data in enumerate(scene_layers):
+                    layer_storage_key = upload_mpi_layer(
+                        user_id, image_id, i, layer_data["texture"]
+                    )
+                    layer_url = get_mpi_layer_url(layer_storage_key)
+                    layer_urls.append({
+                        "id": f"layer_{i}",
+                        "textureUrl": layer_url,
+                        "zIndex": layer_data["z_position"],
+                        "motionScale": layer_data["motion_scale"],
+                        "parallaxDirection": "both",
+                        "blendMode": "premultiplied",
+                        "objectId": layer_data.get("object_id"),
+                        "label": layer_data.get("label", ""),
+                    })
+                logger.info(f"MPI layers uploaded: {len(layer_urls)} layers")
+
+            except Exception as mpi_err:
+                logger.warning(f"MPI layer generation failed (non-blocking): {mpi_err}")
+                layer_urls = None
+
             # ========== 6. 更新 PostgreSQL 数据库状态 ==========
             await redis_client.set_task_progress(
                 task_id=task_id, status="processing", progress=90,
@@ -138,6 +233,7 @@ def estimate_depth(
                 "depth_url": depth_url,
                 "model_used": model_name,
                 "processing_time_ms": round(elapsed_ms, 1),
+                "mpi_layers": layer_urls,
             }
             await redis_client.set_task_progress(
                 task_id=task_id,

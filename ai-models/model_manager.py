@@ -27,6 +27,27 @@ _MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "path": "enhance/real_esrgan",
         "engine_class": None,
     },
+    "sam2": {
+        "name": "SAM2 Segmentation",
+        "version": "v2.0",
+        "weight_file": "sam2_hiera_large.pt",
+        "path": "segmentation/sam",
+        "engine_class": None,
+    },
+    "lama_inpaint": {
+        "name": "LaMa Inpainting",
+        "version": "v1.0",
+        "weight_file": "lama_large.pt",
+        "path": "inpaint/lama",
+        "engine_class": None,
+    },
+    "stable_normal": {
+        "name": "Stable Normal",
+        "version": "v1.0",
+        "weight_file": "stable_normal_turbo.pt",
+        "path": "normal/stable_normal",
+        "engine_class": None,
+    },
 }
 
 
@@ -75,7 +96,82 @@ class ModelManager:
         if model_name == "real_esrgan_x4plus":
             from enhance.real_esrgan.engine import RealESRGANEngine
             return RealESRGANEngine(weight_path, scale=4)
+        if model_name == "sam2":
+            from segmentation.sam.engine import SAM2Engine
+            return SAM2Engine(weight_path)
+        if model_name == "lama_inpaint":
+            from inpaint.lama.engine import LaMaInpaintEngine
+            return LaMaInpaintEngine(weight_path)
+        if model_name == "stable_normal":
+            from normal.stable_normal.engine import StableNormalEngine
+            return StableNormalEngine(weight_path)
         raise ValueError(f"No engine class for model: {model_name}")
+
+    async def run_full_pipeline(self, image: Any) -> dict:
+        """运行完整的场景理解流水线 (Phase 2)
+
+        并行运行 Depth + SAM2 分割 + Stable Normal, 然后四路融合。
+
+        Returns:
+            dict: 融合后的场景数据, 含 fused_depth, seg_mask, normal_map, num_detected_layers
+        """
+        import asyncio
+
+        depth_engine = self.get_engine("depth_anything_v2")
+        has_seg = "sam2" in _MODEL_REGISTRY
+        has_normal = "stable_normal" in _MODEL_REGISTRY
+
+        # 并行运行深度估计和分割
+        tasks = [
+            asyncio.to_thread(depth_engine.predict_with_confidence, image),
+        ]
+        task_names = ["depth"]
+
+        if has_seg:
+            try:
+                seg_engine = self.get_engine("sam2")
+                tasks.append(asyncio.to_thread(seg_engine.predict, image))
+                task_names.append("seg")
+            except Exception:
+                logger.warning("SAM2 engine unavailable, using depth-only pipeline")
+
+        if has_normal:
+            try:
+                normal_engine = self.get_engine("stable_normal")
+                tasks.append(
+                    asyncio.to_thread(normal_engine.predict_normal, image, None)
+                )
+                task_names.append("normal")
+            except Exception:
+                logger.debug("StableNormal unavailable, skipping normal estimation")
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 解析结果
+        depth_result = results[0] if not isinstance(results[0], Exception) else None
+        seg_result = None
+        normal_result = None
+
+        idx = 1
+        for name in task_names[1:]:
+            if idx < len(results):
+                if isinstance(results[idx], Exception):
+                    logger.warning(f"Task '{name}' failed: {results[idx]}")
+                elif name == "seg":
+                    seg_result = results[idx]
+                elif name == "normal":
+                    normal_result = results[idx]
+            idx += 1
+
+        if depth_result is None:
+            raise RuntimeError("Depth estimation failed — pipeline cannot continue")
+
+        if seg_result is None:
+            seg_result = {"seg_mask": None, "num_layers": 3}
+        if normal_result is None:
+            normal_result = {"normal": None, "method": "none", "confidence": None}
+
+        return depth_engine.fuse_multi_modal(depth_result, seg_result, normal_result)
 
     def unload(self, model_name: str) -> None:
         """卸载指定模型释放显存"""

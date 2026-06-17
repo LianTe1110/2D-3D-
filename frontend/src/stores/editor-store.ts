@@ -1,9 +1,10 @@
 import { create } from 'zustand'
-import type { UploadResponse, DepthResult, ProcessingStep, WSMessage, AnimationParams, TaskStatusResponse, ExportStep, ExportOptions, ShareResponse, RenderResponse, StyleQualityParams, ArtStyle, QualityLevel } from '@/types'
+import type { UploadResponse, DepthResult, ProcessingStep, WSMessage, AnimationParams, TaskStatusResponse, ExportStep, ExportOptions, ShareResponse, RenderResponse, StyleQualityParams, ArtStyle, QualityLevel, MPILayer } from '@/types'
 import { ANIMATION_PRESETS } from '@/types'
 import { uploadImage, estimateDepth, getTaskStatus, requestExport, getExportTaskStatus, createShare, initScene } from '@/services/api'
 import { wsClient } from '@/services/ws'
 import { logger } from '@/lib/logger'
+import { getCachedResult, setCachedResult } from '@/lib/performance-cache'
 
 // ============ 轮询配置 ============
 const POLL_INTERVAL_MS = 2000  // WS 断开时每 2 秒轮询
@@ -29,6 +30,9 @@ interface EditorState {
   // 3D 场景
   sceneId: string | null
   sceneData: RenderResponse | null
+
+  // MPI 层纹理
+  mpiLayerUrls: MPILayer[] | null
 
   // 连接状态
   isWsConnected: boolean
@@ -87,6 +91,7 @@ const initialState = {
   depthMapUrl: null,
   sceneId: null,
   sceneData: null,
+  mpiLayerUrls: null,
   isWsConnected: false,
   isPolling: false,
   animation: { ...initialAnimation },
@@ -140,12 +145,18 @@ export const useEditorStore = create<EditorState>((set, get) => {
         logger.debug('store', `Poll result: status=${status.status}, progress=${status.progress}`)
 
         if (status.status === 'completed') {
+          // ⚡ Depth Cache: 保存结果到缓存
+          const img = get().uploadedImage
+          if (img?.image_id && status.result?.depth_url) {
+            setCachedResult(img.image_id, status.result.depth_url, status.result.mpi_layers || [], get().sceneData || {})
+          }
           set({
             step: 'completed',
             progress: 1,
             stepMessage: '深度图生成完成',
             depthResult: status.result || null,
             depthMapUrl: status.result?.depth_url || '',
+            mpiLayerUrls: status.result?.mpi_layers || null,
             isPolling: false,
           })
           stopPolling()
@@ -213,12 +224,18 @@ export const useEditorStore = create<EditorState>((set, get) => {
       logger.info('store', `Syncing task status after WS reconnect: ${taskId}`)
       const status = await getTaskStatus(taskId)
       if (status.status === 'completed') {
+        // ⚡ Depth Cache: 保存结果到缓存
+        const img = get().uploadedImage
+        if (img?.image_id && status.result?.depth_url) {
+          setCachedResult(img.image_id, status.result.depth_url, status.result.mpi_layers || [], get().sceneData || {})
+        }
         set({
           step: 'completed',
           progress: 1,
           stepMessage: '深度图生成完成',
           depthResult: status.result || null,
           depthMapUrl: status.result?.depth_url || '',
+          mpiLayerUrls: status.result?.mpi_layers || null,
         })
         _initSceneAfterDepth(status.result)
         logger.info('store', 'Task already completed (synced via poll)')
@@ -245,7 +262,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
     // ---- 上传 + 深度估计主流程 ----
     handleUpload: async (file: File) => {
       stopPolling()
-      set({ step: 'uploading', progress: 0, error: null, depthResult: null, depthMapUrl: null, sceneId: null, sceneData: null })
+      set({ step: 'uploading', progress: 0, error: null, depthResult: null, depthMapUrl: null, sceneId: null, sceneData: null, mpiLayerUrls: null })
 
       try {
         // 1. 生成本地预览
@@ -256,6 +273,20 @@ export const useEditorStore = create<EditorState>((set, get) => {
         const uploadRes = await uploadImage(file)
         set({ uploadedImage: uploadRes })
         logger.info('store', `Image uploaded: ${uploadRes.image_id}`)
+
+        // ⚡ Depth Cache: 检查是否已有缓存结果
+        const cached = getCachedResult(uploadRes.image_id)
+        if (cached) {
+          logger.info('store', `Cache hit for ${uploadRes.image_id}, skipping inference`)
+          set({
+            step: 'completed',
+            progress: 100,
+            depthMapUrl: cached.depthMapUrl,
+            mpiLayerUrls: cached.mpiLayers,
+            sceneData: cached.sceneData as any,
+          })
+          return
+        }
 
         // 3. 建立 WebSocket 连接（WS 断开时降级为轮询）
         let wsConnected = false
@@ -323,12 +354,18 @@ export const useEditorStore = create<EditorState>((set, get) => {
           stepMessage: data.message || `深度估计中... ${Math.round(progressValue * 100)}%`,
         })
       } else if (msg.type === 'task_completed') {
+        // ⚡ Depth Cache: 保存结果到缓存
+        const img = get().uploadedImage
+        if (img?.image_id && data.result?.depth_url) {
+          setCachedResult(img.image_id, data.result.depth_url, data.result.mpi_layers || [], get().sceneData || {})
+        }
         set({
           step: 'completed',
           progress: 1,
           stepMessage: '深度图生成完成',
           depthResult: data.result || null,
           depthMapUrl: data.result?.depth_url || '',
+          mpiLayerUrls: data.result?.mpi_layers || null,
           isWsConnected: true,
         })
         stopPolling()
