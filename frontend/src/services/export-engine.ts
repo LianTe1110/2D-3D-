@@ -44,43 +44,78 @@ async function getFFmpeg(): Promise<FFmpeg> {
 /**
  * 从 WebGL Canvas 逐帧捕获画面
  *
+ * 兼容 preserveDrawingBuffer: false:
+ *   在同一渲染帧内调用 toBlob() 可正确读取 back buffer 内容。
+ *   使用 requestAnimationFrame 驱动而非 setTimeout，确保捕获与渲染同步，
+ *   避免 async gap 导致的缓冲区清除问题（这也是日常渲染撕裂的根因之一）。
+ *
  * @param canvas 目标 Canvas 元素
  * @param fps 帧率
  * @param durationSeconds 时长(秒)
  * @param onProgress 进度回调 (0~1)
  * @returns PNG 帧数据数组
  */
-async function captureCanvasFrames(
+function captureCanvasFrames(
   canvas: HTMLCanvasElement,
   fps: number,
   durationSeconds: number,
   onProgress?: (progress: number) => void,
 ): Promise<Uint8Array[]> {
-  const totalFrames = fps * durationSeconds
-  const frameInterval = 1000 / fps
-  const frames: Uint8Array[] = []
+  return new Promise((resolve) => {
+    const totalFrames = Math.ceil(fps * durationSeconds)
+    const frameIntervalMs = 1000 / fps
+    const frames: Uint8Array[] = []
+    let frameIndex = 0
+    let lastCaptureTime = 0
 
-  logger.info('export', `Capturing ${totalFrames} frames at ${fps}fps`)
+    logger.info('export', `Capturing ${totalFrames} frames at ${fps}fps (rAF-synced)`)
 
-  for (let i = 0; i < totalFrames; i++) {
-    // 从 WebGL Canvas 读取像素
-    const blob = await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob(resolve, 'image/png')
-    })
+    function captureFrame(timestamp: number) {
+      // 帧率控制：确保间隔 >= frameIntervalMs
+      if (timestamp - lastCaptureTime < frameIntervalMs - 2) {
+        if (frameIndex < totalFrames) {
+          requestAnimationFrame(captureFrame)
+        }
+        return
+      }
+      lastCaptureTime = timestamp
 
-    if (blob) {
-      const arrayBuffer = await blob.arrayBuffer()
-      frames.push(new Uint8Array(arrayBuffer))
+      if (frameIndex >= totalFrames) {
+        logger.info('export', `Captured ${frames.length} frames`)
+        resolve(frames)
+        return
+      }
+
+      // 同步读取当前帧 — 必须在 rAF 回调内调用，与渲染同周期
+      try {
+        const dataUrl = canvas.toDataURL('image/png')
+        // dataURL → Uint8Array
+        const binary = atob(dataUrl.split(',')[1])
+        const bytes = new Uint8Array(binary.length)
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i)
+        }
+        frames.push(bytes)
+      } catch (err) {
+        // 某些浏览器在缓冲区清除时可能失败，跳过该帧
+        logger.warn('export', `Frame ${frameIndex} capture failed: ${err}`)
+      }
+
+      frameIndex++
+      onProgress?.(frameIndex / totalFrames)
+
+      // 继续下一帧
+      if (frameIndex < totalFrames) {
+        requestAnimationFrame(captureFrame)
+      } else {
+        logger.info('export', `Captured ${frames.length} frames`)
+        resolve(frames)
+      }
     }
 
-    onProgress?.(i / totalFrames)
-
-    // 等待下一帧时间
-    await new Promise((resolve) => setTimeout(resolve, frameInterval))
-  }
-
-  logger.info('export', `Captured ${frames.length} frames`)
-  return frames
+    // 启动 rAF 驱动的帧捕获循环
+    requestAnimationFrame(captureFrame)
+  })
 }
 
 // ============ MP4 编码 ============

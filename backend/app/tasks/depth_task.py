@@ -245,7 +245,12 @@ async def _update_database(
             storage_key=depth_storage_key,
             depth_map_url=depth_url,
             processing_time_ms=round(elapsed_ms, 1),
-            params={"bilateral_filter": {"d": 9, "sigma_color": 75, "sigma_space": 75}},
+            params={
+                "bilateral_filter": {"d": 9, "sigma_color": 75, "sigma_space": 75},
+                "gamma": 1.8,
+                "fg_boost": 1.2,
+                "bg_suppress": 0.75,
+            },
             status="ready",
         )
         session.add(depth_map)

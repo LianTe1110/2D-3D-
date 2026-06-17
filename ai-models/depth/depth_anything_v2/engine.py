@@ -26,6 +26,13 @@ MODEL_CONFIGS = {
 # 最大输入分辨率 (避免 OOM)
 MAX_RESOLUTION = 518
 
+# Gamma 默认值 (非线性深度重映射)
+DEFAULT_GAMMA = 1.8
+
+# 前景/背景增强系数
+FG_BOOST = 1.2     # 前景深度乘数 (>1.0 让前景更突出)
+BG_SUPPRESS = 0.75 # 背景深度乘数 (<1.0 让背景更扁平)
+
 
 class DepthAnythingV2Engine(InferenceEngine):
     """Depth Anything V2 深度估计引擎"""
@@ -36,9 +43,15 @@ class DepthAnythingV2Engine(InferenceEngine):
         encoder: str = "vitl",
         max_resolution: int = MAX_RESOLUTION,
         device: str | None = None,
+        gamma: float = DEFAULT_GAMMA,
+        fg_boost: float = FG_BOOST,
+        bg_suppress: float = BG_SUPPRESS,
     ):
         self.encoder = encoder
         self.max_resolution = max_resolution
+        self.gamma = gamma
+        self.fg_boost = fg_boost
+        self.bg_suppress = bg_suppress
         super().__init__(model_path, device)
 
     def _load_model(self) -> torch.nn.Module:
@@ -114,13 +127,15 @@ class DepthAnythingV2Engine(InferenceEngine):
     def _postprocess(
         self, output: torch.Tensor, original_size: tuple[int, int]
     ) -> np.ndarray:
-        """后处理: 插值 → 双边滤波(边缘保持平滑) → 线性归一化 → 8位灰度
+        """后处理: 插值 → Gamma重映射 → Otsu前景强化 → 双边滤波 → 8位灰度
 
         Steps:
             1. 双线性插值回原始尺寸
-            2. 等比例线性映射到 [0, 255]
-            3. cv2.bilateralFilter 边缘保持平滑, 消除网格化噪点
-            4. 转为 uint8 单通道灰度图
+            2. 线性归一化到 [0, 1]
+            3. Gamma 非线性重映射 (前景更凸, 背景更平)
+            4. Otsu 自适应前景/背景分离与增强
+            5. cv2.bilateralFilter 边缘保持平滑
+            6. 转为 uint8 单通道灰度图
         """
         depth = output.squeeze().unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
 
@@ -134,17 +149,67 @@ class DepthAnythingV2Engine(InferenceEngine):
 
         depth_np = depth.squeeze().cpu().numpy()
 
-        # Step 2: 等比例线性映射到 [0, 255]
+        # Step 2: 等比例线性映射到 [0, 1]
         depth_min = depth_np.min()
         depth_max = depth_np.max()
         if depth_max - depth_min > 0:
-            depth_normalized = (depth_np - depth_min) / (depth_max - depth_min) * 255.0
+            depth_normalized = (depth_np - depth_min) / (depth_max - depth_min)
         else:
             depth_normalized = np.zeros_like(depth_np)
 
-        depth_uint8 = depth_normalized.astype(np.uint8)
+        # Step 3: Gamma 非线性重映射
+        # 效果: 压缩背景深度范围, 扩展前景深度范围, 层次感立刻增强
+        gamma = getattr(self, 'gamma', DEFAULT_GAMMA)
+        depth_normalized = np.power(np.clip(depth_normalized, 0, 1), gamma)
 
-        # Step 3: 双边滤波 — 边缘保持平滑, 消除网格化噪点
+        # Step 4: Otsu 自适应前景/背景分离与增强
+        # 无需 SAM 等分割模型, 利用深度直方图自动找到前景/背景分界线
+        fg_boost = getattr(self, 'fg_boost', FG_BOOST)
+        bg_suppress = getattr(self, 'bg_suppress', BG_SUPPRESS)
+
+        if fg_boost != 1.0 or bg_suppress != 1.0:
+            # 计算归一化后的深度直方图
+            hist, _ = np.histogram(
+                depth_normalized.flatten(), bins=256, range=(0, 1)
+            )
+            total = depth_normalized.size
+
+            # Otsu 方法寻找最佳分割阈值
+            best_threshold = 0.5  # 回退默认值
+            best_variance = 0
+            sum_all = np.sum(np.arange(256) * hist)
+
+            for t in range(10, 245):  # 排除极端值
+                w0 = np.sum(hist[:t]) / total       # 背景权重
+                w1 = np.sum(hist[t:]) / total       # 前景权重
+                if w0 < 0.01 or w1 < 0.01:
+                    continue
+
+                sum0 = np.sum(np.arange(t) * hist[:t])
+                sum1 = np.sum(np.arange(t, 256) * hist[t:])
+                mu0 = sum0 / (w0 * total)
+                mu1 = sum1 / (w1 * total)
+
+                variance = w0 * w1 * (mu0 - mu1) ** 2
+                if variance > best_variance:
+                    best_variance = variance
+                    best_threshold = t / 256.0
+
+            logger.debug(f"Otsu threshold: {best_threshold:.3f}, "
+                         f"fg_boost={fg_boost}, bg_suppress={bg_suppress}")
+
+            # 应用前景增强 / 背景抑制
+            fg_mask = depth_normalized > best_threshold
+            depth_normalized = np.where(
+                fg_mask,
+                np.clip(depth_normalized * fg_boost, 0, 1),
+                np.clip(depth_normalized * bg_suppress, 0, 1),
+            )
+
+        # Step 5: 映射到 [0, 255] 并转 uint8
+        depth_uint8 = (np.clip(depth_normalized, 0, 1) * 255.0).astype(np.uint8)
+
+        # Step 6: 双边滤波 — 边缘保持平滑, 消除网格化噪点
         depth_filtered = cv2.bilateralFilter(
             depth_uint8,
             self.BILATERAL_D,

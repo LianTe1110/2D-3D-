@@ -120,8 +120,10 @@ export class AnimationEngine {
   }
 
   private _applyState() {
+    // 仅更新位置，不调用 lookAt()
+    // lookAt() 每帧调用会覆盖 OrbitControls 内部状态，导致画面抖动和撕裂
+    // OrbitControls 已通过 enableDamping 自动管理相机朝向
     this.camera.position.set(this.currentState.x, this.currentState.y, this.currentState.z)
-    this.camera.lookAt(this.currentState.lookX, this.currentState.lookY, this.currentState.lookZ)
   }
 
   // ---- 创建 Tween 动画 ----

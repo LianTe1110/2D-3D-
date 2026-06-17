@@ -10,51 +10,90 @@ import { AnimationEngine } from '@/lib/animation-engine'
 // 算法: PlaneGeometry + 自定义 ShaderMaterial
 // - uTexture:       原图采样器
 // - uDepthTexture:  深度图灰度 PNG 采样器
-// - disparityScale: 视差缩放倍率
+// - 分层参数:       uLayerCount + uLayerScale0~4 (WebGL 1.0 兼容)
+// - 边缘冻结:       uEdgeFreezeStrength (基于原图亮度梯度的边缘保护)
 //
-// 顶点着色器: 根据 UV 采样深度图 Z ∈ [0,1]，沿 Z 轴偏移顶点
-//   transformed.z += (depthValue * disparityScale);
+// 顶点着色器: 根据 UV 采样深度图 → 分层量化 → 每层独立视差倍率 → 动画效果
+//   不再做 Z 轴偏移 (disparityScale 已移除), 视差由 CameraParallaxController 驱动
 //
-// 片元着色器: 边缘扩展 (Edge Extend) + 空洞填充
-//   - 计算深度梯度, 检测边缘断层
-//   - 边缘区域: 多重采样混合 (4 方向 + 8 邻域加权)
+// 片元着色器: 边缘冻结 → 空洞填充 → 边缘扩展 → 画风后处理
+//   - 边缘冻结: 检测原图亮度梯度, 强边缘直接采样 (防止人物/背景黏连)
 //   - 空洞区域: 前景像素扩散填充
+//   - 深度边缘: 多重采样混合
 //   - 保证实时渲染 ≥ 30 FPS
 
 const VERTEX_SHADER = /* glsl */ `
   uniform sampler2D uDepthTexture;
-  uniform float disparityScale;
   uniform float uTime;
   uniform int uAnimType;
   uniform float uAmplitude;
   uniform float uSpeed;
 
+  // 分层参数 (WebGL 1.0 兼容: 独立 uniform 变量, 不用数组)
+  uniform int uLayerCount;           // 层数 (3~5), 1=不分层
+  uniform float uLayerScale0;
+  uniform float uLayerScale1;
+  uniform float uLayerScale2;
+  uniform float uLayerScale3;
+  uniform float uLayerScale4;
+
   varying vec2 vUv;
-  varying float vDepthValue;
+  varying float vDepthValue;         // 原始深度值 (用于边缘冻结)
+  varying float vLayeredDepth;       // 分层后的有效深度值
+
+  // 获取指定层的视差倍率 (if-else 展开, 兼容 WebGL 1.0)
+  float getLayerScale(int idx) {
+    if (idx == 0) return uLayerScale0;
+    else if (idx == 1) return uLayerScale1;
+    else if (idx == 2) return uLayerScale2;
+    else if (idx == 3) return uLayerScale3;
+    else return uLayerScale4;
+  }
 
   void main() {
     vUv = uv;
 
-    // 1. 根据 UV 坐标采样深度图灰度值, Z ∈ [0, 1]
+    // 1. 采样原始深度图
     float depthValue = texture2D(uDepthTexture, uv).r;
     vDepthValue = depthValue;
 
-    // 2. 顶点沿 Z 轴偏移: transformed.z += (depthValue * disparityScale)
-    vec3 transformed = position;
-    transformed.z += (depthValue * disparityScale);
+    // 2. 分层量化 (当 layerCount > 1 时启用)
+    float effectiveDepth = depthValue;
+    if (uLayerCount > 1) {
+      float layerStep = 1.0 / float(uLayerCount);
+      float layerIndex = floor(depthValue / layerStep);
+      layerIndex = clamp(layerIndex, 0.0, float(uLayerCount) - 1.0);
+      int iLayer = int(layerIndex);
 
-    // 3. 动画位移 (可选, 由 uAnimType 控制)
+      // 使用该层的视差倍率 (通过 getLayerScale 避免动态索引)
+      float layerScale = getLayerScale(iLayer);
+      effectiveDepth = depthValue * layerScale;
+
+      // 平滑过渡: 层边界处做混合避免硬切边
+      float layerFract = fract(depthValue / layerStep);
+      float blendWidth = 0.15;  // 过渡带宽度
+      if (layerFract < blendWidth && iLayer > 0) {
+        float prevScale = getLayerScale(iLayer - 1);
+        float mixFactor = smoothstep(0.0, blendWidth, layerFract);
+        effectiveDepth = mix(depthValue * prevScale, effectiveDepth, mixFactor);
+      }
+    }
+
+    vLayeredDepth = effectiveDepth;
+
+    // 3. 动画效果 (基于分层深度)
+    vec3 transformed = position;
     float t = uTime * uSpeed;
 
     if (uAnimType == 1) {
-      // swing: 水平视差 + 前景微动
-      transformed.x += sin(t) * uAmplitude * depthValue * 0.15;
-      transformed.z += cos(t * 0.7) * uAmplitude * depthValue * 0.05;
+      // swing: 水平摆动 + 前景微动
+      transformed.x += sin(t) * uAmplitude * effectiveDepth * 0.15;
+      transformed.z += cos(t * 0.7) * uAmplitude * effectiveDepth * 0.05;
     } else if (uAnimType == 2) {
-      // zoom: 缓慢缩放 + 景深
+      // zoom: 缩放 + 景深
       float scale = 1.0 + sin(t * 0.5) * uAmplitude * 0.08;
       transformed.xy *= scale;
-      transformed.z += sin(t * 0.3) * uAmplitude * depthValue * 0.1;
+      transformed.z += sin(t * 0.3) * uAmplitude * effectiveDepth * 0.1;
     } else if (uAnimType == 3) {
       // rotate: 缓慢旋转
       float angle = sin(t * 0.4) * uAmplitude * 0.15;
@@ -63,11 +102,12 @@ const VERTEX_SHADER = /* glsl */ `
       transformed.xz = mat2(c, -s, s, c) * transformed.xz;
     } else if (uAnimType == 4) {
       // parallax: 水平视差平移
-      transformed.x += sin(t * 0.6) * uAmplitude * depthValue * 0.2;
+      transformed.x += sin(t * 0.6) * uAmplitude * effectiveDepth * 0.2;
     } else if (uAnimType == 5) {
       // dolly: 前进推进
-      transformed.z += sin(t * 0.5) * uAmplitude * depthValue * 0.15;
+      transformed.z += sin(t * 0.5) * uAmplitude * effectiveDepth * 0.15;
     }
+    // uAnimType == 0: none, 不做动画
 
     gl_Position = projectionMatrix * modelViewMatrix * vec4(transformed, 1.0);
   }
@@ -82,6 +122,8 @@ const FRAGMENT_SHADER = /* glsl */ `
 
   varying vec2 vUv;
   varying float vDepthValue;
+  varying float vLayeredDepth;  // 分层后深度
+  uniform float uEdgeFreezeStrength;  // 边缘冻结强度 0~1, 0=不冻结
 
   // ---- 深度梯度计算 (Sobel) ----
   float computeDepthGradient(vec2 uv) {
@@ -276,26 +318,41 @@ const FRAGMENT_SHADER = /* glsl */ `
   }
 
   void main() {
-    // 1. 计算深度梯度
+    // === 1. 计算深度梯度 (用于空洞检测) ===
     float gradient = computeDepthGradient(vUv);
+    float depthEdgeStrength = smoothstep(uEdgeThreshold * 0.5, uEdgeThreshold * 1.5, gradient);
 
-    // 2. 边缘强度: 梯度超过阈值时为边缘
-    float edgeStrength = smoothstep(uEdgeThreshold * 0.5, uEdgeThreshold * 1.5, gradient);
+    // === 2. 边缘冻结检测 (基于原图亮度梯度, 非深度梯度) ===
+    float lumCenter = dot(texture2D(uTexture, vUv).rgb, vec3(0.299, 0.587, 0.114));
+    float lLeft  = dot(texture2D(uTexture, vUv + vec2(-uTexelSize.x, 0.0)).rgb, vec3(0.299, 0.587, 0.114));
+    float lRight = dot(texture2D(uTexture, vUv + vec2( uTexelSize.x, 0.0)).rgb, vec3(0.299, 0.587, 0.114));
+    float lUp    = dot(texture2D(uTexture, vUv + vec2(0.0, -uTexelSize.y)).rgb, vec3(0.299, 0.587, 0.114));
+    float lDown  = dot(texture2D(uTexture, vUv + vec2(0.0,  uTexelSize.y)).rgb, vec3(0.299, 0.587, 0.114));
 
-    // 3. 判断是否为深度断层 (空洞)
-    bool isHole = gradient > uEdgeThreshold * 3.0;
+    float imgEdgeGrad = abs(lLeft - lRight) + abs(lUp - lDown);
+    float edgeFreezeStrength = smoothstep(0.05, 0.20, imgEdgeGrad) * uEdgeFreezeStrength;
 
+    // === 3. 判断空洞 (边缘区域跳过空洞填充) ===
+    bool isHole = gradient > uEdgeThreshold * 3.0 && edgeFreezeStrength < 0.3;
+
+    // === 4. 选择颜色采样策略 (完整分支) ===
     vec4 finalColor;
 
-    if (isHole) {
+    if (edgeFreezeStrength > 0.5) {
+      // 边缘冻结区域: 直接采样原图, 不做任何混合模糊
+      finalColor = texture2D(uTexture, vUv);
+    } else if (isHole) {
+      // 空洞区域: 前景像素扩散填充
       finalColor = holeFillSample(vUv, gradient);
-    } else if (edgeStrength > 0.01) {
-      finalColor = edgeExtendSample(vUv, edgeStrength);
+    } else if (depthEdgeStrength > 0.01) {
+      // 深度边缘非冻结区: 多重采样混合
+      finalColor = edgeExtendSample(vUv, depthEdgeStrength);
     } else {
+      // 正常区域: 直接采样
       finalColor = texture2D(uTexture, vUv);
     }
 
-    // 4. 应用画风后处理
+    // === 5. 应用画风后处理 (保持不变) ===
     if (uArtStyle == 1) {
       finalColor.rgb = animeStyle(finalColor.rgb, vUv);
     } else if (uArtStyle == 2) {
@@ -361,7 +418,6 @@ function DepthMesh() {
       uniforms: {
         uTexture:        { value: null },   // 原图采样器
         uDepthTexture:   { value: null },   // 深度图采样器
-        disparityScale:  { value: rp?.parallax_scale ?? 0.3 },    // 视差缩放倍率
         uTexelSize:      { value: new THREE.Vector2(1.0 / 1024, 1.0 / 1024) }, // 纹素尺寸, 纹理加载后更新
         uEdgeThreshold:  { value: 0.15 },   // 边缘梯度阈值
         uTime:           { value: 0 },
@@ -369,6 +425,15 @@ function DepthMesh() {
         uAmplitude:      { value: 0.3 },
         uSpeed:          { value: 1.0 },
         uArtStyle:       { value: 0 },      // 0=original, 1=anime, 2=oil_painting, 3=watercolor, 4=sketch, 5=cyberpunk, 6=vintage
+        // ===== 分层 uniforms (独立变量, 兼容 WebGL 1.0) =====
+        uLayerCount:     { value: rp?.layer_count ?? 3 },
+        uLayerScale0:    { value: rp?.layer_scales?.[0] ?? 0.15 },
+        uLayerScale1:    { value: rp?.layer_scales?.[1] ?? 0.6 },
+        uLayerScale2:    { value: rp?.layer_scales?.[2] ?? 1.3 },
+        uLayerScale3:    { value: rp?.layer_scales?.[3] ?? 1.8 },
+        uLayerScale4:    { value: rp?.layer_scales?.[4] ?? 2.5 },
+        // ===== 边缘冻结 uniform =====
+        uEdgeFreezeStrength: { value: rp?.edge_freeze_strength ?? 0.8 },
       },
       vertexShader: VERTEX_SHADER,
       fragmentShader: FRAGMENT_SHADER,
@@ -474,6 +539,8 @@ function CameraAnimator() {
   }
 
   // 监听动画参数变化
+  // 注意: 顶点着色器已处理所有动画类型的视差效果 (swing/zoom/rotate/parallax/dolly)
+  // CameraAnimator 仅在需要相机轨迹动画时启用，避免与着色器 uTime 动画冲突导致撕裂
   useEffect(() => {
     const engine = engineRef.current!
     if (isPlaying) {
@@ -500,6 +567,58 @@ function CameraAnimator() {
   return null
 }
 
+// ============ 相机视差控制器 (鼠标驱动相机位移) ============
+//
+// 电影级 2.5D 标准做法: 相机移动 + 深度图驱动视差
+// 冲突规避:
+//   - 动画播放时自动禁用鼠标视差 (避免与 CameraAnimator 冲突)
+//   - 不调用 lookAt() (让 OrbitControls 管理朝向)
+//   - 使用 isInitialized 标志确保 basePosition 在 CameraFitter 之后记录
+//
+function CameraParallaxController() {
+  const { camera } = useThree()
+  const { animation, isPlaying, sceneData } = useEditorStore()
+  const mouseRef = useRef({ x: 0, y: 0 })
+  const basePosition = useRef(new THREE.Vector3(0, 0, 5))
+  const isInitialized = useRef(false)
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      mouseRef.current.x = (e.clientX / window.innerWidth) * 2 - 1
+      mouseRef.current.y = -(e.clientY / window.innerHeight) * 2 + 1
+    }
+    window.addEventListener('mousemove', handleMouseMove)
+    return () => window.removeEventListener('mousemove', handleMouseMove)
+  }, [])
+
+  // 仅在 CameraFitter 设置完成后记录一次 basePosition
+  useEffect(() => {
+    if (!isInitialized.current && camera.position.z > 0 && camera.position.z < 50) {
+      basePosition.current.copy(camera.position)
+      isInitialized.current = true
+    }
+  }, [camera.position.z])
+
+  useFrame(() => {
+    const rp = sceneData?.render_params
+    const intensity = rp?.parallax_scale ?? 0.3
+    const enableMouseParallax = rp?.camera_parallax !== false
+
+    if (!enableMouseParallax || !isInitialized.current) return
+    if (isPlaying && animation.type !== 'none') return
+
+    const targetX = basePosition.current.x + mouseRef.current.x * intensity
+    const targetY = basePosition.current.y + mouseRef.current.y * intensity * 0.6
+
+    const smoothing = 0.08
+    camera.position.x += (targetX - camera.position.x) * smoothing
+    camera.position.y += (targetY - camera.position.y) * smoothing
+    // 不调用 lookAt! 让 OrbitControls 管理朝向
+  })
+
+  return null
+}
+
 // ============ 场景主组件 ============
 
 export function Scene3D() {
@@ -518,8 +637,10 @@ export function Scene3D() {
       gl={{
         antialias: true,
         toneMapping: THREE.NoToneMapping,
-        preserveDrawingBuffer: true,  // 导出时 canvas.toBlob() 需要保留缓冲区
+        preserveDrawingBuffer: false,
       }}
+      frameloop="always"
+      dpr={[1, 2]}
       style={{ width: '100%', height: '100%' }}
     >
       <PerspectiveCamera
@@ -534,6 +655,7 @@ export function Scene3D() {
 
       <CameraFitter />
       <CameraAnimator />
+      <CameraParallaxController />
 
       <OrbitControls
         enableDamping
@@ -547,6 +669,7 @@ export function Scene3D() {
         maxAzimuthAngle={Math.PI * 0.4}
         rotateSpeed={0.5}
         zoomSpeed={0.8}
+        enableRotate={true}
       />
 
       <color attach="background" args={['#1a1a24']} />
