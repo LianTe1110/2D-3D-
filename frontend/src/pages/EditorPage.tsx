@@ -7,13 +7,12 @@ import { Slider } from '@/components/ui/slider'
 import { Separator } from '@/components/ui/separator'
 import { Scene3D } from '@/components/preview/Scene3D'
 import { ANIMATION_PRESETS, ART_STYLES, QUALITY_LEVELS } from '@/types'
-import type { AnimationType, ExportOptions, ArtStyle, QualityLevel } from '@/types'
-import { PRESET_PATHS } from '@/lib/camera-path-engine'
+import type { ExportOptions, ArtStyle, QualityLevel } from '@/types'
 import { exportWithFFmpegWasm, downloadBlob, downloadDepthMap } from '@/services/export-engine'
 import {
   Upload, Loader2, CheckCircle2, XCircle, Play, Pause, RotateCcw,
   Download, Share2, Image as ImageIcon, Layers, Settings2, ChevronDown,
-  Film, FileImage, AlertCircle, ExternalLink, Video,
+  Film, FileImage, AlertCircle, ExternalLink,
 } from 'lucide-react'
 
 export function EditorPage() {
@@ -283,38 +282,6 @@ export function EditorPage() {
                     >
                       <p className="text-[12px] font-medium">{preset.label}</p>
                       <p className="text-[10px] text-white/20 mt-0.5">{preset.desc}</p>
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <Separator className="bg-white/[0.06]" />
-
-              {/* Camera Path Presets */}
-              <div>
-                <p className="text-[11px] text-white/30 uppercase tracking-wider mb-2">相机轨迹</p>
-                <div className="grid grid-cols-2 gap-1.5">
-                  {Object.entries(PRESET_PATHS).map(([key, path]) => (
-                    <button
-                      key={key}
-                      onClick={() => {
-                        // 映射轨迹到动画类型
-                        const pathToAnim: Record<string, AnimationType> = {
-                          cinematic_pan: 'swing',
-                          gentle_orbit: 'rotate',
-                          push_in: 'dolly',
-                          vertical_survey: 'parallax',
-                        }
-                        applyPreset(pathToAnim[key] || 'swing')
-                        if (!isPlaying) togglePlay()
-                      }}
-                      className="text-left p-2.5 rounded-lg border transition-colors bg-white/[0.02] border-white/[0.06] text-white/40 hover:bg-white/[0.04]"
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <Video className="w-3 h-3 text-violet-400/60" />
-                        <p className="text-[12px] font-medium">{path.name}</p>
-                      </div>
-                      <p className="text-[10px] text-white/20 mt-0.5">{path.duration}s 循环</p>
                     </button>
                   ))}
                 </div>

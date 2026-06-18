@@ -844,10 +844,8 @@ export function Scene3D() {
         position={[0, 0, 5]}
       />
 
-      {/* MPI 渲染: 逐物体分层 (N 层动态) */}
-      {hasMPI && mpiLayerUrls ? (
-        <MPIScene />
-      ) : depthMapUrl ? (
+      {/* 深度图渲染: 单层 Mesh + 深度驱动视差 (旧版效果) */}
+      {depthMapUrl ? (
         <DepthMesh />
       ) : null}
 

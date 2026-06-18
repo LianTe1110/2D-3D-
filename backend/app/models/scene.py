@@ -39,7 +39,7 @@ class Scene(Base, TimestampMixin):
     models_used: Mapped[dict | None] = mapped_column(JSONB, default=None)  # {"depth": "dav2", "seg": "sam2"}
     processing_time_ms: Mapped[float | None] = mapped_column(Float, default=None)
     camera_config: Mapped[dict | None] = mapped_column(JSONB, default=None)
-    metadata: Mapped[dict | None] = mapped_column(JSONB, default=None)
+    scene_metadata: Mapped[dict | None] = mapped_column("metadata", JSONB, default=None)
 
     __table_args__ = (
         Index("ix_scenes_user_id", "user_id"),
