@@ -149,6 +149,20 @@ const LAYER_FRAGMENT_SHADER = /* glsl */ `
     return sqrt(gx * gx + gy * gy);
   }
 
+  // === Level 3: MPI 层边缘瑕疵遮罩（仅极端区域，不影响正常轮廓） ===
+  float layerEdgeArtifactMask(vec2 uv) {
+    // 只在极高 soft-mask 梯度处淡出（真正分层边界瑕疵）
+    float maskEdge = computeSoftMaskEdge(uv);
+    float extremeFade = 1.0 - smoothstep(0.20, 0.45, maskEdge);
+
+    // UV 边界极窄淡出
+    float margin = 0.02;
+    float edgeX = smoothstep(0.0, margin, uv.x) * smoothstep(0.0, margin, 1.0 - uv.x);
+    float edgeY = smoothstep(0.0, margin, uv.y) * smoothstep(0.0, margin, 1.0 - uv.y);
+
+    return max(extremeFade, edgeX * edgeY);
+  }
+
   void main() {
     float softMask = texture2D(uSoftMask, vUv).r;
 
@@ -171,13 +185,14 @@ const LAYER_FRAGMENT_SHADER = /* glsl */ `
     // Level 3: Soft mask blending (0~1 alpha)
     color.a *= softMask;
 
-    // Border feather: 防止边缘黑边
+    // Border feather + 边缘瑕疵遮罩：防止露出底层建模
     float borderDist = min(
       min(sampleUv.x, 1.0 - sampleUv.x),
       min(sampleUv.y, 1.0 - sampleUv.y)
     );
-    float borderFeather = smoothstep(0.0, 0.02, borderDist);
-    color.a *= borderFeather;
+    float borderFeather = smoothstep(0.0, 0.03, borderDist);
+    float artifactFade = layerEdgeArtifactMask(vUv);
+    color.a *= borderFeather * artifactFade;
 
     if (color.a < 0.005) discard;
 
@@ -589,6 +604,20 @@ const FRAGMENT_SHADER = /* glsl */ `
     return color;
   }
 
+  // === 边缘瑕疵遮罩：仅针对位移后露出的底层建模，不影响物体正常轮廓 ===
+  float edgeArtifactMask(vec2 uv) {
+    // 只在极高梯度处（真正瑕疵/空洞，非正常物体边缘）做淡出
+    float dg = computeDepthGradient(uv);
+    float extremeEdge = 1.0 - smoothstep(0.25, 0.50, dg);
+
+    // UV 边界淡出（仅最外圈，防止平面边缘露底）
+    float margin = 0.02;
+    float edgeX = smoothstep(0.0, margin, uv.x) * smoothstep(0.0, margin, 1.0 - uv.x);
+    float edgeY = smoothstep(0.0, margin, uv.y) * smoothstep(0.0, margin, 1.0 - uv.y);
+
+    return max(extremeEdge, edgeX * edgeY);
+  }
+
   void main() {
     float gradient = computeDepthGradient(vUv);
     float depthEdgeStrength = smoothstep(uEdgeThreshold * 0.5, uEdgeThreshold * 1.5, gradient);
@@ -611,6 +640,12 @@ const FRAGMENT_SHADER = /* glsl */ `
       finalColor = texture2D(uTexture, vUv);
     }
     finalColor.rgb = applyArtStyle(finalColor.rgb, vUv, uArtStyle);
+
+    // 应用边缘瑕疵遮罩：淡出而非硬裁切，避免露出底部/侧边建模
+    float artifactMask = edgeArtifactMask(vUv);
+    finalColor.a *= artifactMask;
+    if (finalColor.a < 0.01) discard;
+
     gl_FragColor = finalColor;
   }
 `
@@ -667,6 +702,9 @@ function DepthMesh() {
       },
       vertexShader: VERTEX_SHADER,
       fragmentShader: FRAGMENT_SHADER,
+      transparent: true,
+      depthTest: true,
+      depthWrite: false,
       toneMapped: false,
     })
   }, [sceneData?.render_params])

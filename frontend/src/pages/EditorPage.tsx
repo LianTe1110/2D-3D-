@@ -191,7 +191,7 @@ export function EditorPage() {
       {/* Left: Preview area */}
       <div className="flex-1 flex flex-col p-4 gap-4 min-w-0">
         {/* 3D Preview */}
-        <div className="flex-1 rounded-2xl bg-white/[0.02] border border-white/[0.06] min-h-[300px] relative overflow-hidden">
+        <div className="flex-1 rounded-2xl bg-white/[0.02] border border-white/[0.06] min-h-[770px] relative overflow-hidden">
           <Suspense fallback={
             <div className="absolute inset-0 flex items-center justify-center">
               <Loader2 className="w-6 h-6 text-violet-400/60 animate-spin" />
