@@ -402,10 +402,30 @@ const VERTEX_SHADER = /* glsl */ `
     else return uLayerScale4;
   }
 
+  float computeVertDepthGradient(vec2 uv) {
+    float ts = 1.0 / 512.0;
+    float d00 = texture2D(uDepthTexture, uv + vec2(-ts, -ts)).r;
+    float d10 = texture2D(uDepthTexture, uv + vec2( 0.0, -ts)).r;
+    float d20 = texture2D(uDepthTexture, uv + vec2( ts, -ts)).r;
+    float d01 = texture2D(uDepthTexture, uv + vec2(-ts,  0.0)).r;
+    float d21 = texture2D(uDepthTexture, uv + vec2( ts,  0.0)).r;
+    float d02 = texture2D(uDepthTexture, uv + vec2(-ts,  ts)).r;
+    float d12 = texture2D(uDepthTexture, uv + vec2( 0.0,  ts)).r;
+    float d22 = texture2D(uDepthTexture, uv + vec2( ts,  ts)).r;
+    float gx = -d00 - 2.0*d01 - d02 + d20 + 2.0*d21 + d22;
+    float gy = -d00 - 2.0*d10 - d20 + d02 + 2.0*d12 + d22;
+    return sqrt(gx * gx + gy * gy);
+  }
+
   void main() {
     vUv = uv;
     float depthValue = texture2D(uDepthTexture, uv).r;
     vDepthValue = depthValue;
+
+    // === 边缘位移衰减：必须在分层缩放之前判断，确保轮廓处整体位移都降低 ===
+    float vertGrad = computeVertDepthGradient(uv);
+    float displacementFalloff = 1.0 - smoothstep(0.03, 0.18, vertGrad);
+
     float effectiveDepth = depthValue;
     if (uLayerCount > 1) {
       float layerStep = 1.0 / float(uLayerCount);
@@ -422,6 +442,10 @@ const VERTEX_SHADER = /* glsl */ `
         effectiveDepth = mix(depthValue * prevScale, effectiveDepth, mixFactor);
       }
     }
+
+    // 轮廓处整体深度缩放降低 → 所有方向位移都降低
+    effectiveDepth *= displacementFalloff;
+
     vLayeredDepth = effectiveDepth;
     vec3 transformed = position;
     float t = uTime * uSpeed;
@@ -604,23 +628,8 @@ const FRAGMENT_SHADER = /* glsl */ `
     return color;
   }
 
-  // === 边缘瑕疵遮罩：仅针对位移后露出的底层建模，不影响物体正常轮廓 ===
-  float edgeArtifactMask(vec2 uv) {
-    // 只在极高梯度处（真正瑕疵/空洞，非正常物体边缘）做淡出
-    float dg = computeDepthGradient(uv);
-    float extremeEdge = 1.0 - smoothstep(0.25, 0.50, dg);
-
-    // UV 边界淡出（仅最外圈，防止平面边缘露底）
-    float margin = 0.02;
-    float edgeX = smoothstep(0.0, margin, uv.x) * smoothstep(0.0, margin, 1.0 - uv.x);
-    float edgeY = smoothstep(0.0, margin, uv.y) * smoothstep(0.0, margin, 1.0 - uv.y);
-
-    return max(extremeEdge, edgeX * edgeY);
-  }
-
   void main() {
     float gradient = computeDepthGradient(vUv);
-    float depthEdgeStrength = smoothstep(uEdgeThreshold * 0.5, uEdgeThreshold * 1.5, gradient);
     float lumCenter = dot(texture2D(uTexture, vUv).rgb, vec3(0.299, 0.587, 0.114));
     float lLeft  = dot(texture2D(uTexture, vUv + vec2(-uTexelSize.x, 0.0)).rgb, vec3(0.299, 0.587, 0.114));
     float lRight = dot(texture2D(uTexture, vUv + vec2( uTexelSize.x, 0.0)).rgb, vec3(0.299, 0.587, 0.114));
@@ -629,23 +638,20 @@ const FRAGMENT_SHADER = /* glsl */ `
     float imgEdgeGrad = abs(lLeft - lRight) + abs(lUp - lDown);
     float edgeFreezeStrength = smoothstep(0.05, 0.20, imgEdgeGrad) * uEdgeFreezeStrength;
     bool isHole = gradient > uEdgeThreshold * 3.0 && edgeFreezeStrength < 0.3;
+
+    // 人物/物体锐利边缘直接取原色，不做任何混合（避免边缘白边/黑边）
     vec4 finalColor;
-    if (edgeFreezeStrength > 0.5) {
+    if (edgeFreezeStrength > 0.5 || gradient > uEdgeThreshold * 2.0) {
       finalColor = texture2D(uTexture, vUv);
     } else if (isHole) {
       finalColor = holeFillSample(vUv, gradient);
-    } else if (depthEdgeStrength > 0.01) {
-      finalColor = edgeExtendSample(vUv, depthEdgeStrength);
     } else {
       finalColor = texture2D(uTexture, vUv);
     }
     finalColor.rgb = applyArtStyle(finalColor.rgb, vUv, uArtStyle);
 
-    // 应用边缘瑕疵遮罩：淡出而非硬裁切，避免露出底部/侧边建模
-    float artifactMask = edgeArtifactMask(vUv);
-    finalColor.a *= artifactMask;
-    if (finalColor.a < 0.01) discard;
-
+    // 始终不透明，不丢弃像素
+    finalColor.a = 1.0;
     gl_FragColor = finalColor;
   }
 `
@@ -704,7 +710,8 @@ function DepthMesh() {
       fragmentShader: FRAGMENT_SHADER,
       transparent: true,
       depthTest: true,
-      depthWrite: false,
+      depthWrite: true,
+      side: THREE.DoubleSide,
       toneMapped: false,
     })
   }, [sceneData?.render_params])
