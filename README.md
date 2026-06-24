@@ -16,7 +16,9 @@
 
 ### 1. 视差摆动动画（GIF）
 
-![3D 视差效果](leiapix_3d_1a97fd82.gif)![3D 视差效果](leiapix_3d_4efd139a.gif)![3D 视差效果](leiapix_3d_c25cf8c3.gif)
+![3D 视差效果](leiapix_3d_1a97fd82.gif)
+![3D 视差效果](leiapix_3d_4efd139a.gif)
+![3D 视差效果](leiapix_3d_c25cf8c3.gif)
 
 > 单层深度 + GLSL 视差位移着色器
 > 前景猫咪 → 中景石墙 → 远景天空，鼠标拖拽可自由旋转视角
