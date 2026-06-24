@@ -1,6 +1,6 @@
 # 2D → 3D 图片转换工具
 
-> 字节跳动-青训营项目 · 基于 AI 深度估计 + Three.js 的图片 3D 化工具
+> 基于 AI 深度估计 + Three.js 的图片 3D 化工具
 
 [![React](https://img.shields.io/badge/React-19-61dafb?logo=react)](https://react.dev)
 [![TypeScript](https://img.shields.io/badge/TypeScript-6-3178c6?logo=typescript)](https://www.typescriptlang.org)
@@ -16,7 +16,7 @@
 
 ### 1. 视差摆动动画（GIF）
 
-![3D 视差效果](leiapix_3d_1a97fd82.gif)
+![3D 视差效果](leiapix_3d_1a97fd82.gif)(leiapix_3d_4efd139a.gif)
 
 > 单层深度 + GLSL 视差位移着色器
 > 前景猫咪 → 中景石墙 → 远景天空，鼠标拖拽可自由旋转视角
