@@ -1,4 +1,4 @@
-# LeiaPix AI
+# 2D → 3D 图片转换工具
 
 2D → 3D 图片转换工具，基于 AI 深度估计与 Three.js 3D 渲染。
 
