@@ -12,8 +12,9 @@
 
 ---
 ## 首页和工作台
-    <img width="3018" height="1602" alt="屏幕截图 2026-06-24 103318" src="https://github.com/user-attachments/assets/43b14fb1-31f9-4029-b585-598f6e51ef2c" />
-    <img width="3052" height="1618" alt="屏幕截图 2026-06-24 103216" src="https://github.com/user-attachments/assets/51f112ea-598e-48c4-88d3-b3c462da4b17" />
+   ![Uploading 屏幕截图 2026-06-24 103318.png…]()![Uploading 屏幕截图 2026-06-24 103216.png…]()
+
+
 
 
 
